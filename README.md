@@ -2,47 +2,59 @@
 
 PoC: bridge `pkgs.dockerTools.buildImage` into Kubernetes manifests with the
 registry digest computed **at nix eval time** — no registry round-trip, no
-manual repin.
+manual repin, no container tooling.
 
-## The claim, proven
+## The claim, proven end-to-end
 
 ```bash
-nix build .#poc-image-digest   # sha256:223c03e3…  (known before any push)
-nix build .#oci-layout         # deterministic OCI layout
-skopeo copy --dest-tls-verify=false \
-  oci:$(nix build .#oci-layout --print-out-paths):bridge-poc \
-  docker://<registry>/bridge-poc:poc
-# registry answers: Docker-Content-Digest: sha256:223c03e3…  — identical
+nix build .#oci-layout .#poc-image-digest
+cat ./result-poc-image-digest
+#   sha256:3f1c2ea8…            <- known BEFORE any push
+./push.sh "$(readlink -f ./result-oci-layout)" bridge-poc poc http://localhost:5555
+curl -s -H "Accept: application/vnd.oci.image.manifest.v1+json" -I \
+  http://localhost:5555/v2/bridge-poc/manifests/poc | grep -i docker-content-digest
+#   Docker-Content-Digest: sha256:3f1c2ea8…   <- IDENTICAL
 ```
 
 `packages.#kustomize-pin` renders the kustomize `images:` transformer carrying
-that digest. One flake eval owns image + pin; a CI push + pin commit closes
-the loop into a GitOps repo.
+that digest. One flake eval owns image + pin; CI pushes byte-exact and commits
+the pin — the manual repin loop is gone.
 
-## The trap this design avoids
+## How it works (no skopeo, sandbox-safe)
 
-Hashing the `docker-archive` manifest does **not** predict the registry
-digest: registry pushes recompress layers and rewrite the manifest (observed:
-61MB uncompressed layer became a 5.3MB gzip blob, different digest). The
-bridge normalizes once — `docker-archive → oci:` layout, content-addressed and
-deterministic — reads the manifest digest from `index.json`, and pushes **from
-that layout**, so the registry stores exactly the hashed bytes.
+`oci-layout` derivation: extract the docker-archive tarball, content-address
+config + layer blobs (`sha256sum`), assemble the OCI manifest + `index.json`
+with `printf`. Pure nix output; deterministic because `dockerTools` pins
+`created` to epoch+1.
 
-Determinism: `dockerTools` defaults `created` to epoch+1, and the conversion
-is pure, so the same closure always yields the same digest.
+`push.sh`: POST blob uploads + PUT the manifest **verbatim** via the registry
+HTTP API.
+
+## The three traps this design avoids
+
+1. **docker-archive pushes recompress layers.** Observed: 61MB uncompressed
+   layer → 5.3MB gzip, different digest. Hashing the archive manifest can
+   never predict the registry digest.
+2. **skopeo remarshals OCI manifests** (→ Docker schema2 media types) even
+   when pushing layout→registry. Any tool-driven push changes the bytes.
+3. **skopeo's docker-archive transport hardcodes `/var/tmp`** — cannot run in
+   the Linux nix sandbox at all.
+
+Byte-exactness requires owning both ends: assemble in nix, push with curl.
 
 ## Multi-arch ceiling
 
-`oci-layout` pins one platform manifest. A mixed-arch fleet needs the
-**index** digest (a platform digest pins every node to one arch — containerd
-does no arch check on digest pulls). Extend by merging per-arch layouts into
-an OCI index before hashing; `index.json` then names the index digest the same
-way.
+The layout pins one platform manifest. A mixed-arch fleet needs the **index**
+digest (a platform digest pins every node to one arch — containerd does no
+arch check on digest pulls). Extend by merging per-arch layouts into an OCI
+index before hashing; `index.json` then names the index digest the same way.
 
 ## Repo layout
 
-- `flake.nix` — everything: image, layout, digest, pin, checks
-- `.github/workflows/nix.yaml` — `nix flake check` + pin render on PR/push
+- `flake.nix` — image → layout → digest → kustomize pin, with self-checks
+- `push.sh` — byte-exact registry push (the bridge's deploy half)
+- `.github/workflows/nix.yaml` — `nix flake check` + pin render
 
-Registry acceptance was executed against an ephemeral `registry:2` pod pushed
-from the layout; digests matched byte-for-byte.
+Registry acceptance executed against an ephemeral `registry:2` pod: registry
+digest == eval-time digest, byte-exact. Bootstrapped via sks-repo; 5-ruleset
+template from infinity-blackhole/orbit.
