@@ -34,29 +34,44 @@
             # image -> layout -> digest chain is a pure function of the closure.
           };
 
-          # The bridge core: normalize ONCE into a content-addressed OCI
-          # layout. Deterministic input => identical layout => identical
-          # digests. Push happens FROM this layout, so the registry stores
-          # exactly these bytes. (Hashing the docker-archive manifest instead
-          # is a trap: registry pushes recompress layers and rewrite the
-          # manifest — observed: 61MB uncompressed layer became a 5.3MB gzip
-          # blob with a different digest.)
+          # The bridge core, skopeo-free: assemble the OCI layout directly
+          # from the docker-archive tarball (config + layer tars are all
+          # there). Digest = sha256 of bytes nix itself produced — no
+          # external tool, no registry round-trip, runs in the sandbox.
+          # (skopeo's docker-archive transport hardcodes /var/tmp and
+          # cannot run sandboxed on linux; also registry pushes of the
+          # raw archive recompress layers and change the digest — observed
+          # 61MB layer -> 5.3MB gzip. Push FROM this layout instead.)
           oci-layout = pkgs.runCommand "bridge-poc-oci"
             {
-              nativeBuildInputs = [
-                pkgs.skopeo
-                pkgs.jq
-              ];
+              nativeBuildInputs = [ pkgs.jq ];
             }
             ''
-              export REGISTRY_AUTH_FILE=$PWD/.skopeo-auth
-              # sandbox has no containers policy.json; give skopeo an accept-all one
-              echo '{"default":[{"type":"insecureAcceptAnything"}]}' > policy.json
-              skopeo --policy policy.json copy docker-archive:${poc-image} oci:$out:bridge-poc
-              # sanity: layout must be self-consistent (blob filename == content hash)
-              m=$(jq -r '.manifests[0].digest' $out/index.json | cut -d: -f2)
-              echo "$m" | grep -qE '^[0-9a-f]{64}$' || { echo "bad manifest digest in index.json"; exit 1; }
-              test "$(sha256sum $out/blobs/sha256/$m | cut -d' ' -f1)" = "$m" \
+              set -eu
+              mkdir -p $out/blobs/sha256 tmp
+              tar -xf ${poc-image} -C tmp
+              cfg=$(jq -r '.[0].Config' tmp/manifest.json)
+              cfgd=''${cfg%.json}
+              cp tmp/$cfg $out/blobs/sha256/$cfgd
+              cfgsize=$(wc -c < $out/blobs/sha256/$cfgd | tr -d ' ')
+              layers=""
+              for l in $(jq -r '.[0].Layers[]' tmp/manifest.json); do
+                d=$(sha256sum tmp/$l | cut -d' ' -f1)
+                cp tmp/$l $out/blobs/sha256/$d
+                sz=$(wc -c < tmp/$l | tr -d ' ')
+                layers="$layers{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar\",\"digest\":\"sha256:$d\",\"size\":$sz},"
+              done
+              printf '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:%s","size":%s},"layers":[%s]}' \
+                "$cfgd" "$cfgsize" "''${layers%,}" > manifest.json
+              md=$(sha256sum manifest.json | cut -d' ' -f1)
+              cp manifest.json $out/blobs/sha256/$md
+              msize=$(wc -c < manifest.json | tr -d ' ')
+              printf '{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:%s","size":%s,"annotations":{"org.opencontainers.image.ref.name":"bridge-poc"}}]}' \
+                "$md" "$msize" > $out/index.json
+              echo '{"imageLayoutVersion": "1.0.0"}' > $out/oci-layout
+              # sanity: layout self-consistent (blob filename == content hash)
+              echo "$md" | grep -qE '^[0-9a-f]{64}$' || { echo "bad manifest digest"; exit 1; }
+              test "$(sha256sum $out/blobs/sha256/$md | cut -d' ' -f1)" = "$md" \
                 || { echo "manifest blob content-address mismatch"; exit 1; }
             '';
 
