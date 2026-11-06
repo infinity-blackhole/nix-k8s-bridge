@@ -1,0 +1,17 @@
+name: Nix
+permissions:
+  contents: read
+"on":
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: cachix/install-nix-action@0f95a6b5725d647fc87f0a3a216ef8cc4b36d555 # v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - run: nix flake check --accept-flake-config
+      - run: nix build .#kustomize-pin --accept-flake-config && cat ./result
